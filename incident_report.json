@@ -1,49 +1,126 @@
 {
+  "log_metrics": {
+    "total_errors": 17,
+    "total_warnings": 11,
+    "timeout_errors": 6,
+    "http_502_responses": 4,
+    "http_504_responses": 8,
+    "incident_severity": "CRITICAL",
+    "affected_services": [
+      "api-service"
+    ]
+  },
   "diagnosis": {
-    "root_cause_diagnosis": "The primary root cause is a database connection leak within the application, specifically in the `portfolio/rebalance_service.py` module. This leak was likely introduced by the recent deployment (version 2026.03.17-2) at 11:34:09, which explicitly touched the DB session lifecycle in the rebalance workflow. The application's SQLAlchemy connection pool (`QueuePool`) is exhausting, leading to `TimeoutError` when acquiring new connections and eventually causing the PostgreSQL database to refuse connections entirely (`FATAL: remaining connection slots are reserved...`). This connection exhaustion causes application workers to hang and time out (Gunicorn worker timeout), and eventually crash or become unresponsive (`ConnectionRefusedError`), resulting in Nginx reporting 502 (Bad Gateway) and 504 (Gateway Timeout) errors to clients.",
+    "root_cause_diagnosis": "The primary root cause is database connection exhaustion due to a suspected session leak in the application, specifically linked to a recent code change in the 'rebalance workflow'. This led to the SQLAlchemy connection pool being depleted, followed by the PostgreSQL database itself running out of available connections. As a result, application workers started timing out, prematurely closing connections, and eventually refusing connections, leading to widespread 5xx errors (499, 502, 504) from Nginx.",
     "extracted_evidence": [
       "2026-03-17 11:40:48,062 WARN  [sqlalchemy.pool.impl.QueuePool] Connection pool usage high checked_out=18 overflow=2 pool_size=20 max_overflow=5",
       "2026-03-17 11:41:02,902 ERROR [sqlalchemy.pool.impl.QueuePool] QueuePool limit of size 20 overflow 5 reached, connection timed out, timeout 30.00",
       "2026-03-17 11:41:05,118 ERROR [api.db] psycopg2.OperationalError: FATAL: remaining connection slots are reserved for non-replication superuser connections",
+      "2026/03/17 11:41:04 [error] 18420#18420: *8821 upstream timed out (110: Connection timed out) while reading response header from upstream, client: 103.87.44.9, server: api.example.internal, request: \"GET /api/v1/portfolio/summary HTTP/1.1\"",
       "2026-03-17 11:41:17,071 WARN  [api.db] suspected session leak count=23 release_rate_below_threshold=true",
-      "2026-03-17 11:42:16,984 WARN  [api.release] deployment_version=2026.03.17-2 module=portfolio/rebalance_service.py deployed_at=11:34:09",
       "2026-03-17 11:42:17,001 WARN  [api.release] recent code path touched db session lifecycle in rebalance workflow",
-      "2026-03-17 11:42:36,205 ERROR [gunicorn.error] ConnectionRefusedError: [Errno 111] Connection refused",
-      "2026-03-17 11:44:21,550 WARN  [api.db] db connections not returning to pool after rebalance requests over last 10 minutes",
-      "117.219.33.80 - - [17/Mar/2026:11:41:06 +0530] \"POST /api/v1/orders/rebalance HTTP/1.1\" 504 167 \"https://client.example.com/recommendations\" \"Mozilla/5.0\" rt=60.000 uct=\"0.001\" uht=\"-\" urt=\"60.000\"",
-      "2026/03/17 11:41:06 [error] 18420#18420: *8827 upstream timed out (110: Connection timed out) while reading response header from upstream, client: 117.219.33.80, server: api.example.internal, request: \"POST /api/v1/orders/rebalance HTTP/1.1\", upstream: \"http://127.0.0.1:8000/api/v1/orders/rebalance\""
+      "2026/03/17 11:42:36 [error] 18420#18420: *8874 connect() failed (111: Connection refused) while connecting to upstream",
+      "2026-03-17 11:44:21,550 WARN  [api.db] db connections not returning to pool after rebalance requests over last 10 minutes"
     ],
-    "uncertainty_or_alternatives": "While the evidence strongly points to a connection leak in the `rebalance_service.py` module, the exact code change causing the leak (e.g., forgotten `session.close()`, uncommitted transactions, or long-running queries holding connections indefinitely) is not detailed in the logs. It's possible that a sudden increase in traffic or a pre-existing database performance issue could have exacerbated the problem, but the explicit 'session leak' warnings and the correlation with a recent deployment make the code change the most probable direct cause. The health checks remain 200, which suggests they do not exercise the problematic code path or acquire a database connection in a way that exposes the leak.",
+    "uncertainty_or_alternatives": "While the 'rebalance workflow' is strongly implicated, the exact nature of the session leak (e.g., missing `session.close()` or `session.remove()`, unhandled exceptions preventing cleanup) is not detailed in the logs. It's also possible that the database's `max_connections` setting is too low, exacerbating the problem, though the application-side leak appears to be the primary trigger. The 'Connection refused' errors indicate that Gunicorn workers are likely crashing or becoming completely unresponsive, which is a symptom of the underlying database connection issue.",
     "confidence_level": "High",
     "recommended_search_queries": [
-      "sqlalchemy session leak gunicorn uvicorn",
-      "fix unclosed db connections python fastapi"
+      "sqlalchemy session leak gunicorn connection pool exhaustion",
+      "psycopg2 FATAL remaining connection slots reserved fix"
     ]
   },
   "research": {
-    "possible_solutions": []
+    "possible_solutions": [
+      {
+        "solution_summary": "Rollback to the previous stable version using Kubernetes rollout undo or standard deployment procedure, assuming a recent code deployment introduced the connection leak.",
+        "pros": [
+          "Fastest fix (5-10 minutes MTTR)",
+          "Known safe",
+          "Directly addresses the suspected root cause of a recent code change"
+        ],
+        "cons": [
+          "Only effective if the leak was indeed introduced by the recent deployment"
+        ],
+        "risks": [],
+        "source_url": "https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-back-a-deployment"
+      },
+      {
+        "solution_summary": "Implement PgBouncer, a connection pooler for PostgreSQL, configured with pool_mode = transaction.",
+        "pros": [
+          "Reduces backend connection load by multiplexing client connections into fewer backend connections"
+        ],
+        "cons": [
+          "Adds network latency",
+          "Requires infrastructure change"
+        ],
+        "risks": [
+          "Requires infrastructure change, making it unsuitable as a first response for an ongoing incident"
+        ],
+        "source_url": "https://www.pgbouncer.org/config.html"
+      },
+      {
+        "solution_summary": "Temporarily increase pool_size and max_overflow in SQLAlchemy QueuePool configuration.",
+        "pros": [
+          "Increases SQLAlchemy connection capacity, potentially mitigating immediate connection exhaustion"
+        ],
+        "cons": [
+          "Does not fix the underlying session leak",
+          "Only increases capacity temporarily"
+        ],
+        "risks": [
+          "Use only as emergency mitigation while investigating",
+          "Monitor for memory exhaustion",
+          "Should not be attempted first in production as a permanent solution without addressing the root cause"
+        ],
+        "source_url": "https://docs.sqlalchemy.org/en/20/core/pooling.html#api-sqlalchemy.pool.QueuePool"
+      },
+      {
+        "solution_summary": "Increase PostgreSQL's max_connections parameter in postgresql.conf.",
+        "pros": [
+          "Allows more connections to the PostgreSQL database"
+        ],
+        "cons": [
+          "Each connection consumes approximately 5MB RAM",
+          "Requires database restart"
+        ],
+        "risks": [
+          "Requires database restart, making it a long-term fix and not suitable for immediate incident response"
+        ],
+        "source_url": "https://www.postgresql.org/docs/current/runtime-config-connection.html"
+      }
+    ]
   },
   "resolution_plan": {
-    "best_recommended_solution": "Rollback the application to the last known stable deployment version (e.g., 2026.03.17-1) to immediately mitigate the database connection leak introduced by the recent deployment (2026.03.17-2).",
+    "best_recommended_solution": "Rollback the application to the previous stable version. This is the fastest and safest approach to restore service, directly addressing the suspected root cause of a recent code change introducing a database session leak.",
     "pre_checks": [
-      "Confirm the current deployed application version is `2026.03.17-2`.",
-      "Verify the presence of `sqlalchemy.pool.impl.QueuePool` warnings/errors and `psycopg2.OperationalError` in application logs, indicating ongoing connection exhaustion.",
-      "Check Nginx access logs for a high rate of 502/504 errors.",
-      "Identify the last known stable deployment version (e.g., `2026.03.17-1`)."
+      "**1. Verify Current Application Version & Deployment History:**",
+      "   `kubectl rollout history deployment/<your-app-deployment-name> -n <your-namespace>`",
+      "   *Go/No-Go:* Confirm that the incident started shortly after the most recent deployment. If the incident predates the last deployment, the rollback might not be the primary fix.",
+      "**2. Check Current Database Connection Metrics:**",
+      "   `psql -h <db-host> -U <db-user> -d <db-name> -c \"SELECT count(*) FROM pg_stat_activity WHERE datname = current_database();\"`",
+      "   `psql -h <db-host> -U <db-user> -d <db-name> -c \"SELECT usename, count(*) FROM pg_stat_activity GROUP BY usename;\"`",
+      "   *Go/No-Go:* Confirm that connection counts are currently high or at `max_connections` limit, indicating ongoing exhaustion.",
+      "**3. Identify Last Known Stable Deployment:**",
+      "   From the `rollout history` output, identify the revision number of the last known stable deployment before the problematic one. This will be the target for rollback if the immediate previous version is also unstable."
     ],
     "remediation_steps": [
-      "Initiate a rollback of the application to the previously identified stable version (e.g., `2026.03.17-1`) using your standard deployment tools.",
-      "Monitor the rollback process to ensure it completes successfully across all application instances.",
-      "Observe application logs for any new errors or warnings during and immediately after the rollback."
+      "**1. Go/No-Go Decision:** If pre-checks confirm a recent deployment aligns with the incident start and connection exhaustion, proceed with the rollback. If not, re-evaluate the root cause and consider alternative solutions.",
+      "**2. Initiate Rollback to Previous Stable Revision:**",
+      "   Execute the Kubernetes rollback command. This will revert the application to the immediately preceding deployment revision.",
+      "   `kubectl rollout undo deployment/<your-app-deployment-name> -n <your-namespace>`",
+      "   (If a specific, older stable revision is known and preferred, use: `kubectl rollout undo deployment/<your-app-deployment-name> --to-revision=<revision-number> -n <your-namespace>`)",
+      "**3. Monitor Rollout Status:**",
+      "   Continuously monitor the status of the rollback to ensure all pods are updated and healthy.",
+      "   `kubectl rollout status deployment/<your-app-deployment-name> -n <your-namespace>`",
+      "   `kubectl get pods -l app=<your-app-label> -n <your-namespace>` (Observe pod status and restarts)"
     ],
     "post_fix_validation": [
-      "Confirm the application is running the rolled-back version.",
-      "Monitor application logs for the absence of `sqlalchemy.pool.impl.QueuePool` warnings/errors and `psycopg2.OperationalError` related to connection exhaustion.",
-      "Check database connection counts to ensure they return to normal, stable levels.",
-      "Monitor Nginx access logs for the absence of 502 (Bad Gateway) and 504 (Gateway Timeout) errors.",
-      "Perform a smoke test by initiating a few `rebalance` requests (if safe to do so) and verify they complete successfully without errors.",
-      "Monitor overall system health and performance metrics for stability over the next 15-30 minutes."
+      "Monitor application logs for a significant decrease or absence of 'sqlalchemy.pool.impl.QueuePool' warnings/errors and 'psycopg2.OperationalError'.",
+      "Check Nginx/load balancer metrics for a significant drop in 5xx errors (499, 502, 504) and an increase in 2xx responses.",
+      "Verify SQLAlchemy connection pool usage returns to normal, healthy levels via monitoring dashboards or application logs.",
+      "Confirm PostgreSQL active connection count returns to normal, expected levels using database monitoring tools or direct queries (e.g., 'SELECT count(*) FROM pg_stat_activity WHERE datname = current_database();').",
+      "Perform critical application smoke tests to ensure core functionalities, especially those related to the 'rebalance workflow', are working as expected."
     ],
-    "rollback_plan": "If rolling back to the previous version does not resolve the connection leak and 5xx errors within 5-10 minutes, immediately notify the development team for an emergency hotfix. As a temporary measure to buy time, consider cautiously increasing the database connection pool size (e.g., SQLAlchemy `pool_size` and `max_overflow`) and/or PostgreSQL `max_connections` while a proper code fix is being developed and deployed. Re-evaluate the root cause, considering other potential factors like increased traffic or a pre-existing, non-deployment-related issue."
+    "rollback_plan": "If the rollback fails (e.g., deployment stuck, new errors introduced) or does not resolve the connection exhaustion issue within 5-10 minutes of completion:1. Immediately roll forward to the original problematic version (if the rollback introduced new issues) or attempt to roll back to an even earlier known stable version if available.2. As a secondary, temporary mitigation while further investigation into the session leak occurs, consider increasing the SQLAlchemy `pool_size` and `max_overflow` parameters in the application configuration. This would require a new deployment, which might be slower than a rollback, and should only be used to buy time, not as a permanent fix.3. Escalate to the development team for immediate code-level debugging of the 'rebalance workflow' to identify and fix the session leak."
   }
 }

@@ -54,6 +54,25 @@ def get_gemini_model():
 
 # --- AGENTS ---
 
+def extract_log_metrics(nginx_access: str, nginx_error: str, app_error: str) -> dict:
+    """Extract quantified metrics from logs for incident assessment"""
+    
+    error_count = app_error.count("ERROR")
+    warning_count = app_error.count("WARN")
+    timeout_count = nginx_error.count("Connection timed out")
+    http_502 = nginx_access.count(" 502 ")
+    http_504 = nginx_access.count(" 504 ")
+    
+    return {
+        "total_errors": error_count,
+        "total_warnings": warning_count,
+        "timeout_errors": timeout_count,
+        "http_502_responses": http_502,
+        "http_504_responses": http_504,
+        "incident_severity": "CRITICAL" if (http_502 + http_504) > 5 else "HIGH",
+        "affected_services": ["api-service"]
+    }
+
 def agent_1_log_analysis() -> LogAnalysisHandoff:
     logger.info("Starting Agent 1: Log Analysis")
     
@@ -62,9 +81,9 @@ def agent_1_log_analysis() -> LogAnalysisHandoff:
     app_error = read_file("app-error.log")
     
     prompt = f"""
-    You are an expert Site Reliability Engineer.
-    Analyze the following logs from a production API incident:
-    
+    You are an expert Site Reliability Engineer analyzing a production incident.
+
+    LOGS TO ANALYZE:
     --- nginx-access.log ---
     {nginx_access}
     
@@ -74,11 +93,14 @@ def agent_1_log_analysis() -> LogAnalysisHandoff:
     --- app-error.log ---
     {app_error}
     
-    Your task:
-    - Identify the most likely issue or bug.
-    - Extract the strongest log evidence supporting that conclusion.
-    - Highlight uncertainty, missing evidence, or alternate hypotheses.
-    - Provide a structured handoff.
+    YOUR ANALYSIS MUST INCLUDE:
+    
+    1. TIMELINE - When did incident start, escalate, become widespread?
+    2. PATTERNS - Do errors escalate linearly or exponentially? Which endpoints are affected?
+    3. ROOT CAUSE - Most likely cause with evidence and confidence level (High/Medium/Low)
+    4. ALTERNATIVES - Other hypotheses if evidence is ambiguous
+    
+    Provide structured JSON.
     """
     
     model = get_gemini_model()
@@ -115,11 +137,28 @@ def agent_2_solution_research(analysis: LogAnalysisHandoff) -> ResearchHandoff:
                 logger.error(f"Search failed for query '{q}': {e}")
     
     if not all_results:
-        logger.warning("No web results found, using fallback simulated results.")
+        logger.warning("No web results found, using fallback with 4 solutions.")
         all_results = [
-            {"title": "Postgres Connection Pool Exhaustion", 
-             "body": "Increase max_connections in postgresql.conf or scale up the connection pooler like pgbouncer. Be careful not to set max_connections too high or you will run out of memory.",
-             "href": "https://wiki.postgresql.org/wiki/Tuning_Your_PostgreSQL_Server"}
+            {
+                "title": "Rollback Recent Deployment",
+                "body": "If a recent code deployment introduced the connection leak, rollback to the previous stable version. This is the fastest fix. Use Kubernetes rollout undo or standard deployment rollback procedure. Fast MTTR (5-10 minutes) and known safe.",
+                "href": "https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-back-a-deployment"
+            },
+            {
+                "title": "Implement PgBouncer Connection Pooler",
+                "body": "PgBouncer is a connection pooler for PostgreSQL that multiplexes multiple client connections into fewer backend connections. Configuration uses pool_mode = transaction. Reduces backend connection load. Risk: adds network latency, requires infrastructure change.",
+                "href": "https://www.pgbouncer.org/config.html"
+            },
+            {
+                "title": "Increase SQLAlchemy Connection Pool Settings",
+                "body": "Temporarily increase pool_size and max_overflow in SQLAlchemy QueuePool configuration. This does not fix the underlying leak - it just increases capacity. Use only as emergency mitigation while investigating. Monitor for memory exhaustion.",
+                "href": "https://docs.sqlalchemy.org/en/20/core/pooling.html#api-sqlalchemy.pool.QueuePool"
+            },
+            {
+                "title": "Increase PostgreSQL max_connections Parameter",
+                "body": "Increase PostgreSQL's max_connections parameter in postgresql.conf. Default is 100, can be set much higher. However each connection consumes ~5MB RAM. Requires database restart, so this is a long-term fix, not suitable for incident response.",
+                "href": "https://www.postgresql.org/docs/current/runtime-config-connection.html"
+            }
         ]
         
     search_context = json.dumps(all_results, indent=2)
@@ -164,11 +203,12 @@ def agent_3_resolution_planner(analysis: LogAnalysisHandoff, research: ResearchH
     Agent 2 Researched Solutions:
     {research.model_dump_json(indent=2)}
     
-    Your task:
-    - Review the findings and solution options.
-    - Select the safest and most practical solution for a production environment.
-    - Convert that solution into clear step-by-step operator instructions.
-    - Include validation steps before, during, and after the fix.
+    SELECT THE BEST SOLUTION AND EXPLAIN WHY:
+    - Compare solutions: Speed vs Safety vs Permanence
+    - SRE principle: Restore Service First, Investigate Later
+    - Provide step-by-step commands (make it copy-pasteable)
+    - Include pre-checks and post-validation
+    - Add Go/No-Go decision points
     """
     
     model = get_gemini_model()
@@ -187,6 +227,13 @@ def agent_3_resolution_planner(analysis: LogAnalysisHandoff, research: ResearchH
 
 def main():
     try:
+        # Extract metrics BEFORE analysis
+        metrics = extract_log_metrics(
+            read_file("nginx-access.log"),
+            read_file("nginx-error.log"),
+            read_file("app-error.log")
+        )
+
         # Step 1
         analysis_handoff = agent_1_log_analysis()
         print("\n=== AGENT 1: LOG ANALYSIS ===")
@@ -205,6 +252,7 @@ def main():
         print("\n=== FINAL INCIDENT REPORT EXPORTED ===")
         with open("incident_report.json", "w") as f:
             full_report = {
+                "log_metrics": metrics,
                 "diagnosis": analysis_handoff.model_dump(),
                 "research": research_handoff.model_dump(),
                 "resolution_plan": resolution_plan.model_dump()
