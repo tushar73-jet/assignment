@@ -1,0 +1,49 @@
+{
+  "diagnosis": {
+    "root_cause_diagnosis": "The primary root cause is a database connection leak within the application, specifically in the `portfolio/rebalance_service.py` module. This leak was likely introduced by the recent deployment (version 2026.03.17-2) at 11:34:09, which explicitly touched the DB session lifecycle in the rebalance workflow. The application's SQLAlchemy connection pool (`QueuePool`) is exhausting, leading to `TimeoutError` when acquiring new connections and eventually causing the PostgreSQL database to refuse connections entirely (`FATAL: remaining connection slots are reserved...`). This connection exhaustion causes application workers to hang and time out (Gunicorn worker timeout), and eventually crash or become unresponsive (`ConnectionRefusedError`), resulting in Nginx reporting 502 (Bad Gateway) and 504 (Gateway Timeout) errors to clients.",
+    "extracted_evidence": [
+      "2026-03-17 11:40:48,062 WARN  [sqlalchemy.pool.impl.QueuePool] Connection pool usage high checked_out=18 overflow=2 pool_size=20 max_overflow=5",
+      "2026-03-17 11:41:02,902 ERROR [sqlalchemy.pool.impl.QueuePool] QueuePool limit of size 20 overflow 5 reached, connection timed out, timeout 30.00",
+      "2026-03-17 11:41:05,118 ERROR [api.db] psycopg2.OperationalError: FATAL: remaining connection slots are reserved for non-replication superuser connections",
+      "2026-03-17 11:41:17,071 WARN  [api.db] suspected session leak count=23 release_rate_below_threshold=true",
+      "2026-03-17 11:42:16,984 WARN  [api.release] deployment_version=2026.03.17-2 module=portfolio/rebalance_service.py deployed_at=11:34:09",
+      "2026-03-17 11:42:17,001 WARN  [api.release] recent code path touched db session lifecycle in rebalance workflow",
+      "2026-03-17 11:42:36,205 ERROR [gunicorn.error] ConnectionRefusedError: [Errno 111] Connection refused",
+      "2026-03-17 11:44:21,550 WARN  [api.db] db connections not returning to pool after rebalance requests over last 10 minutes",
+      "117.219.33.80 - - [17/Mar/2026:11:41:06 +0530] \"POST /api/v1/orders/rebalance HTTP/1.1\" 504 167 \"https://client.example.com/recommendations\" \"Mozilla/5.0\" rt=60.000 uct=\"0.001\" uht=\"-\" urt=\"60.000\"",
+      "2026/03/17 11:41:06 [error] 18420#18420: *8827 upstream timed out (110: Connection timed out) while reading response header from upstream, client: 117.219.33.80, server: api.example.internal, request: \"POST /api/v1/orders/rebalance HTTP/1.1\", upstream: \"http://127.0.0.1:8000/api/v1/orders/rebalance\""
+    ],
+    "uncertainty_or_alternatives": "While the evidence strongly points to a connection leak in the `rebalance_service.py` module, the exact code change causing the leak (e.g., forgotten `session.close()`, uncommitted transactions, or long-running queries holding connections indefinitely) is not detailed in the logs. It's possible that a sudden increase in traffic or a pre-existing database performance issue could have exacerbated the problem, but the explicit 'session leak' warnings and the correlation with a recent deployment make the code change the most probable direct cause. The health checks remain 200, which suggests they do not exercise the problematic code path or acquire a database connection in a way that exposes the leak.",
+    "confidence_level": "High",
+    "recommended_search_queries": [
+      "sqlalchemy session leak gunicorn uvicorn",
+      "fix unclosed db connections python fastapi"
+    ]
+  },
+  "research": {
+    "possible_solutions": []
+  },
+  "resolution_plan": {
+    "best_recommended_solution": "Rollback the application to the last known stable deployment version (e.g., 2026.03.17-1) to immediately mitigate the database connection leak introduced by the recent deployment (2026.03.17-2).",
+    "pre_checks": [
+      "Confirm the current deployed application version is `2026.03.17-2`.",
+      "Verify the presence of `sqlalchemy.pool.impl.QueuePool` warnings/errors and `psycopg2.OperationalError` in application logs, indicating ongoing connection exhaustion.",
+      "Check Nginx access logs for a high rate of 502/504 errors.",
+      "Identify the last known stable deployment version (e.g., `2026.03.17-1`)."
+    ],
+    "remediation_steps": [
+      "Initiate a rollback of the application to the previously identified stable version (e.g., `2026.03.17-1`) using your standard deployment tools.",
+      "Monitor the rollback process to ensure it completes successfully across all application instances.",
+      "Observe application logs for any new errors or warnings during and immediately after the rollback."
+    ],
+    "post_fix_validation": [
+      "Confirm the application is running the rolled-back version.",
+      "Monitor application logs for the absence of `sqlalchemy.pool.impl.QueuePool` warnings/errors and `psycopg2.OperationalError` related to connection exhaustion.",
+      "Check database connection counts to ensure they return to normal, stable levels.",
+      "Monitor Nginx access logs for the absence of 502 (Bad Gateway) and 504 (Gateway Timeout) errors.",
+      "Perform a smoke test by initiating a few `rebalance` requests (if safe to do so) and verify they complete successfully without errors.",
+      "Monitor overall system health and performance metrics for stability over the next 15-30 minutes."
+    ],
+    "rollback_plan": "If rolling back to the previous version does not resolve the connection leak and 5xx errors within 5-10 minutes, immediately notify the development team for an emergency hotfix. As a temporary measure to buy time, consider cautiously increasing the database connection pool size (e.g., SQLAlchemy `pool_size` and `max_overflow`) and/or PostgreSQL `max_connections` while a proper code fix is being developed and deployed. Re-evaluate the root cause, considering other potential factors like increased traffic or a pre-existing, non-deployment-related issue."
+  }
+}
